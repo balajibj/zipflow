@@ -1,15 +1,13 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const packageJson = readJson(path.join(root, 'package.json'));
-const shrinkwrap = readJson(path.join(root, 'npm-shrinkwrap.json'));
-const temporary = mkdtempSync(path.join(os.tmpdir(), 'zipflow-package-'));
 
 function run(command, args, options = {}) {
   return execFileSync(command, args, {
@@ -30,33 +28,100 @@ function run(command, args, options = {}) {
   });
 }
 
-try {
-  const [pack] = JSON.parse(run('npm', [
-    'pack', '--json', '--ignore-scripts', '--dry-run=false', '--pack-destination', temporary,
-  ]));
-  const included = new Set(pack.files.map((file) => file.path));
-  assert.ok(included.has('npm-shrinkwrap.json'), 'published package must include npm-shrinkwrap.json');
-  for (const forbidden of ['package-lock.json', 'node_modules/', 'test/', '.zipflow/', '.env']) {
-    assert.equal([...included].some((file) => file === forbidden || file.startsWith(forbidden)), false, `forbidden packed path: ${forbidden}`);
+export function npmInvocation(args, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const execPath = options.execPath ?? process.execPath;
+  const isFile = options.isFile ?? isRegularFile;
+  const normalizedArgs = args.map((argument) => String(argument));
+  if (platform !== 'win32') return { command: 'npm', args: normalizedArgs, env: {} };
+
+  const lifecycleEntrypoint = validatedNpmLifecycleEntrypoint(env.npm_execpath, isFile);
+  if (lifecycleEntrypoint) {
+    return { command: execPath, args: [lifecycleEntrypoint, ...normalizedArgs], env: {} };
   }
-  const tarball = path.join(temporary, pack.filename);
-  const expectedDependencies = expectedDependencyVersions(shrinkwrap);
-  const first = installAndReadVersions(tarball, path.join(temporary, 'consumer-one'), expectedDependencies);
-  const second = installAndReadVersions(tarball, path.join(temporary, 'consumer-two'), expectedDependencies);
-  assert.deepEqual(second, first, 'two clean package installations must resolve the same dependency versions');
-  for (const [name, expected] of Object.entries(packageJson.dependencies)) {
-    assert.equal(first[name], expected, `${name} must resolve to the pinned runtime version`);
-    assert.equal(shrinkwrap.packages[`node_modules/${name}`]?.version, expected, `${name} must match npm-shrinkwrap.json`);
+
+  const commandProcessor = env.ComSpec ?? env.COMSPEC ?? 'cmd.exe';
+  if (path.win32.basename(commandProcessor).toLowerCase() !== 'cmd.exe') {
+    throw new Error('Windows npm verification requires cmd.exe when npm_execpath is unavailable');
   }
-  console.log(`Verified zipflow ${packageJson.version}: ${pack.entryCount} files; deterministic runtime dependencies installed twice.`);
-} finally {
-  rmSync(temporary, { recursive: true, force: true });
+  const argumentEnv = {};
+  const argumentReferences = normalizedArgs.map((argument, index) => {
+    if (/["\0\r\n]/.test(argument)) throw new Error('Windows npm verification argument contains an unsupported character');
+    const key = `ZIPFLOW_NPM_ARG_${index}`;
+    argumentEnv[key] = argument;
+    return `"%${key}%"`;
+  });
+  const commandText = ['npm.cmd', ...argumentReferences].join(' ');
+  return {
+    command: commandProcessor,
+    args: ['/d', '/s', '/v:off', '/c', commandText],
+    env: argumentEnv,
+  };
 }
 
-function installAndReadVersions(tarball, directory, expectedDependencies) {
+export function packageSmokeEndpoint(platform, directory, uniqueId) {
+  if (platform === 'win32') {
+    const safeId = String(uniqueId).replace(/[^A-Za-z0-9._-]/g, '-');
+    return `\\\\.\\pipe\\zipflow-packed-client-${safeId}`;
+  }
+  return path.posix.join(directory, 'api.sock');
+}
+
+function validatedNpmLifecycleEntrypoint(candidate, isFile) {
+  if (!candidate || !path.win32.isAbsolute(candidate)) return null;
+  const normalized = path.win32.normalize(candidate).toLowerCase();
+  if (!normalized.endsWith('\\npm\\bin\\npm-cli.js')) return null;
+  return isFile(candidate) ? candidate : null;
+}
+
+function isRegularFile(target) {
+  try { return statSync(target).isFile(); } catch { return false; }
+}
+
+function runNpm(args, options = {}) {
+  const invocation = npmInvocation(args);
+  return run(invocation.command, invocation.args, {
+    ...options,
+    env: {
+      ...options.env,
+      ...invocation.env,
+    },
+  });
+}
+
+function verifyPackageInstall() {
+  const packageJson = readJson(path.join(root, 'package.json'));
+  const shrinkwrap = readJson(path.join(root, 'npm-shrinkwrap.json'));
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'zipflow-package-'));
+  try {
+    const [pack] = JSON.parse(runNpm([
+      'pack', '--json', '--ignore-scripts', '--dry-run=false', '--pack-destination', temporary,
+    ]));
+    const included = new Set(pack.files.map((file) => file.path));
+    assert.ok(included.has('npm-shrinkwrap.json'), 'published package must include npm-shrinkwrap.json');
+    for (const forbidden of ['package-lock.json', 'node_modules/', 'test/', '.zipflow/', '.env']) {
+      assert.equal([...included].some((file) => file === forbidden || file.startsWith(forbidden)), false, `forbidden packed path: ${forbidden}`);
+    }
+    const tarball = path.join(temporary, pack.filename);
+    const expectedDependencies = expectedDependencyVersions(shrinkwrap);
+    const first = installAndReadVersions(tarball, path.join(temporary, 'consumer-one'), expectedDependencies, packageJson);
+    const second = installAndReadVersions(tarball, path.join(temporary, 'consumer-two'), expectedDependencies, packageJson);
+    assert.deepEqual(second, first, 'two clean package installations must resolve the same dependency versions');
+    for (const [name, expected] of Object.entries(packageJson.dependencies)) {
+      assert.equal(first[name], expected, `${name} must resolve to the pinned runtime version`);
+      assert.equal(shrinkwrap.packages[`node_modules/${name}`]?.version, expected, `${name} must match npm-shrinkwrap.json`);
+    }
+    console.log(`Verified zipflow ${packageJson.version}: ${pack.entryCount} files; deterministic runtime dependencies installed twice.`);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
+function installAndReadVersions(tarball, directory, expectedDependencies, packageJson) {
   mkdirSync(directory);
   writeFileSync(path.join(directory, 'package.json'), `${JSON.stringify({ private: true }, null, 2)}\n`);
-  run('npm', [
+  runNpm([
     'install', '--ignore-scripts', '--package-lock=false', '--no-audit', '--no-fund',
     '--fetch-retries=0', '--fetch-timeout=10000', tarball,
   ], { cwd: directory });
@@ -84,21 +149,18 @@ function installAndReadVersions(tarball, directory, expectedDependencies) {
 
 function verifyInstalledClient(directory) {
   const smokePath = path.join(directory, 'client-smoke.mjs');
+  const socketPath = packageSmokeEndpoint(process.platform, directory, `${process.pid}-${randomUUID()}`);
   writeFileSync(smokePath, String.raw`
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import http from 'node:http';
-import os from 'node:os';
-import path from 'node:path';
-import { mkdtemp, rm } from 'node:fs/promises';
 const before = {
   sigint: process.listenerCount('SIGINT'),
   sigterm: process.listenerCount('SIGTERM'),
 };
 const { createZipflowClient } = await import('zipflow/client');
 const { getConformanceFixture } = await import('zipflow/protocol');
-const temporary = await mkdtemp(path.join(os.tmpdir(), 'zipflow-packed-client-'));
-const socketPath = path.join(temporary, 'api.sock');
+const socketPath = ${JSON.stringify(socketPath)};
 const token = 'packed-client-authentication-token';
 const server = http.createServer((request, response) => {
   assert.equal(request.url, '/v1/hello');
@@ -126,12 +188,10 @@ try {
   const closed = once(server, 'close');
   server.close();
   await closed;
-  await rm(temporary, { recursive: true, force: true });
 }
 `);
   run(process.execPath, [smokePath], { cwd: directory });
 }
-
 
 function expectedDependencyVersions(lock) {
   const versions = {};
@@ -152,3 +212,6 @@ function packageNameFromLockPath(packagePath) {
 function readJson(target) {
   return JSON.parse(readFileSync(target, 'utf8'));
 }
+
+const entrypoint = process.argv[1] ? path.resolve(process.argv[1]) : null;
+if (entrypoint === fileURLToPath(import.meta.url)) verifyPackageInstall();

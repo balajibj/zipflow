@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { access, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { npmInvocation, packageSmokeEndpoint } from '../scripts/verify-package-install.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageJson = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
@@ -47,4 +48,49 @@ test('package README stays concise and sends detailed guidance to docs', async (
     'docs/development.md',
     'docs/updates.md',
   ]) await access(path.join(root, file));
+});
+
+test('package verifier selects bounded npm launchers without changing arguments', () => {
+  const argumentsToPreserve = [
+    'install', '--ignore-scripts', 'C:\\Temp\\zip flow & proof\\zipflow-1.9.0.tgz',
+  ];
+  assert.deepEqual(npmInvocation(argumentsToPreserve, {
+    platform: 'linux', env: {}, execPath: '/usr/bin/node', isFile: () => false,
+  }), {
+    command: 'npm', args: argumentsToPreserve, env: {},
+  });
+
+  const npmCli = 'C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js';
+  assert.deepEqual(npmInvocation(argumentsToPreserve, {
+    platform: 'win32', env: { npm_execpath: npmCli }, execPath: 'C:\\Program Files\\nodejs\\node.exe',
+    isFile: (candidate) => candidate === npmCli,
+  }), {
+    command: 'C:\\Program Files\\nodejs\\node.exe', args: [npmCli, ...argumentsToPreserve], env: {},
+  });
+
+  const fallback = npmInvocation(argumentsToPreserve, {
+    platform: 'win32', env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+    execPath: 'C:\\Program Files\\nodejs\\node.exe', isFile: () => false,
+  });
+  assert.equal(fallback.command, 'C:\\Windows\\System32\\cmd.exe');
+  assert.deepEqual(fallback.args.slice(0, 4), ['/d', '/s', '/v:off', '/c']);
+  assert.equal(fallback.args[4], 'npm.cmd "%ZIPFLOW_NPM_ARG_0%" "%ZIPFLOW_NPM_ARG_1%" "%ZIPFLOW_NPM_ARG_2%"');
+  assert.deepEqual(fallback.env, {
+    ZIPFLOW_NPM_ARG_0: argumentsToPreserve[0],
+    ZIPFLOW_NPM_ARG_1: argumentsToPreserve[1],
+    ZIPFLOW_NPM_ARG_2: argumentsToPreserve[2],
+  });
+  assert.doesNotMatch(fallback.args[4], /zip flow|ignore-scripts/);
+});
+
+test('package verifier selects a unique Windows named pipe and preserves Unix sockets', () => {
+  assert.equal(
+    packageSmokeEndpoint('win32', 'C:\\ignored', '1234-proof'),
+    '\\\\.\\pipe\\zipflow-packed-client-1234-proof',
+  );
+  assert.notEqual(
+    packageSmokeEndpoint('win32', 'C:\\ignored', '1234-proof'),
+    packageSmokeEndpoint('win32', 'C:\\ignored', '1234-other'),
+  );
+  assert.equal(packageSmokeEndpoint('linux', '/tmp/zipflow-packed-client', 'ignored'), '/tmp/zipflow-packed-client/api.sock');
 });
